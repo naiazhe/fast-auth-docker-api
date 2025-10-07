@@ -1,89 +1,55 @@
-import secrets
-from fastapi import FastAPI, HTTPException, Depends, status
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+# auth.py
 
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from passlib.context import CryptContext
+from sqlalchemy.orm import Session
+from database import get_db, DBUser
+import crud
+
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
-from models import User, UserInDB
+from passlib.context import CryptContext
 
-security = HTTPBasic()
+from models import User
 
-def authentication_user(credentials: HTTPBasicCredentials = Depends(security)):
-    correct_username = secrets.compare_digest(credentials.username, "admin")
-    correct_password = secrets.compare_digest(credentials.password, "secret")
-
-    if not (correct_username and correct_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED    ,
-            detail="Invalid Credentials",
-            headers={"WWW-Authentication":"Basic"}
-        )
-
-    return credentials.username
-
-#  Configuration
+# --- Configuration ---
 SECRET_KEY = "your_secret_key"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-# Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-# OAuth2 scheme
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-#  fake database
-fake_users_db = {
-    "johndoe": {
-        "username": "johndoe",
-        "full_name": "John Doe",
-        "email": "johndoe@example.com",
-        "hashed_password": "$2b$12$.e0e9hhjqrosfbmwXhC7teyfVSH4TsBQvm.pmit9gmGSw.TrxvEVi",
-        "disabled": False,
-    }
-}
 
-def verify_password(plain_password, hashed_password):
-    """Verify a plain password against a hashed password."""
-    return pwd_context.verify(plain_password, hashed_password)
-
-def get_password_hash(password):
-    """Generate a hashed password."""
-    return pwd_context.hash(password)
-
-def get_user(db, username: str):
-    """Get user from the database."""
-    if username in db:
-        user_dict = db[username]
-        return UserInDB(**user_dict)
-    
-def authenticate_user(fake_db, username: str, password: str):
-    """Check if username and password are correct."""
-    user = get_user(fake_db, username)
-    if not user:
-        return False
-    if not verify_password(password, user.hashed_password):
-        return False
-    return user
-
+# --- Token Creation ---
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     """Create a JWT access token."""
     to_encode = data.copy()
     if expires_delta:
         expire = datetime.now(timezone.utc) + expires_delta
     else:
-        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
-
+        expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-async def get_current_user(token: str = Depends(oauth2_scheme)):
-    """Get the current user from the token."""
+
+# --- Helper Function ---
+def convert_db_user_to_user(db_user: DBUser) -> User:
+    """Convert a DBUser SQLAlchemy model to a User Pydantic model."""
+    return User(
+        username=db_user.username,
+        email=db_user.email,
+        full_name=db_user.full_name,
+        disabled=not db_user.is_active,
+        roles=[role.name for role in db_user.roles]
+    )
+
+
+# --- Dependency Functions ---
+async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    """Decode JWT token to get the current user."""
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -96,14 +62,15 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
             raise credentials_exception
     except JWTError:
         raise credentials_exception
-    
-    user = get_user(fake_users_db, username=username)
-    if user is None:
+        
+    db_user = crud.get_user_by_username(db, username=username)
+    if db_user is None:
         raise credentials_exception
-    return user
+    return convert_db_user_to_user(db_user)
+
 
 async def get_current_active_user(current_user: User = Depends(get_current_user)):
-    """Check if the current user is active."""
+    """Ensure the current user is active (not disabled)."""
     if current_user.disabled:
         raise HTTPException(status_code=400, detail="Inactive user")
     return current_user
